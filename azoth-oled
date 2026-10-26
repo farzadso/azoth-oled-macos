@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""Upload custom GIFs and images to the ROG Azoth Extreme OLED from macOS.
+
+Armoury Crate Gear for Mac ships the full custom-animation backend but hides
+the upload panel whenever the host is a Mac. This tool sends the same request
+the hidden panel would send to the app's local server, so the app's own code
+crops the image, converts it to RGB565, and writes it to the keyboard.
+
+Requirements: Armoury Crate Gear running, and the keyboard in wired mode on
+its USB-C cable. In Bluetooth mode the cable only charges it.
+
+Not affiliated with or endorsed by ASUS. ROG, Azoth, and Armoury Crate are
+trademarks of ASUSTeK Computer Inc.
+"""
+
+import argparse
+import json
+import mimetypes
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+SERVER = "http://127.0.0.1:1042"
+# The app logs every HID report it sends, which is the only view into transfer progress.
+SERVICE_LOG = Path.home() / "Library/Application Support/ASUS/asus.service.log"
+DEVICE_TYPE_KEYBOARD = "2"
+PANEL_WIDTH, PANEL_HEIGHT = 184, 97
+MAX_FRAMES = 196
+# The server gives up on an upload after 20 minutes.
+UPLOAD_TIMEOUT_S = 1200
+# Measured over USB: 64-byte reports with 58 bytes of RGB565 each, about 110 per second.
+PACKET_PAYLOAD = 58
+PACKETS_PER_SECOND = 110
+
+# PIDs from the app's dll/keyboard/config.ini for ROG AZOTH EXTREME.
+PID_USB, PID_DONGLE, PID_BLE = "6975", "6978", "6977"
+CONNECTIONS = {PID_USB: "USB cable", PID_DONGLE: "2.4 GHz dongle", PID_BLE: "Bluetooth"}
+
+PRESETS = {
+    "0": "rog_logo",
+    "1": "city_rog_light",
+    "2": "building_rog_light",
+    "3": "rog_explosion",
+    "4": "city_firework",
+    "5": "rog_shines",
+}
+
+
+class ToolError(Exception):
+    pass
+
+
+class TransferProgress:
+    """Follows an image transfer through the app's packet log.
+
+    A transfer starts with `61 01 00 00 <count LE32>`, sends data packets
+    `61 02 <remaining LE16>` counting down to 0, and ends with `61 03`.
+    """
+
+    TAIL_BYTES = 256 * 1024
+    HEADER_SCAN_LIMIT = 256 << 20
+
+    def __init__(self, since=None):
+        self.since = since  # ignore packets logged before this time
+        self.total = None
+        self.remaining = None
+        self.finished = False
+        self.last_packet_at = None
+
+    @staticmethod
+    def _stamp(line):
+        try:
+            return datetime.fromisoformat(line[:25])
+        except ValueError:
+            return None
+
+    def _reports(self):
+        with open(SERVICE_LOG, "rb") as f:
+            size = f.seek(0, 2)
+            f.seek(max(0, size - self.TAIL_BYTES))
+            lines = f.read().decode("latin-1").splitlines()
+        for prev, line in zip(lines, lines[1:]):
+            if line.startswith("00000000  ") and ("Write to " in prev or "Read from " in prev):
+                yield self._stamp(prev), line.split()[1:17]
+
+    def _find_total(self):
+        chunk = 8 << 20
+        with open(SERVICE_LOG, "rb") as f:
+            end = pos = f.seek(0, 2)
+            while pos > 0 and end - pos < self.HEADER_SCAN_LIMIT:
+                pos = max(0, pos - chunk)
+                f.seek(pos)
+                text = f.read(min(chunk + 4096, end - pos)).decode("latin-1")
+                i = text.rfind("00000000  61 01 00 00 ")
+                if i >= 0:
+                    b = text[i:i + 40].split()[1:9]
+                    return int(b[7] + b[6] + b[5] + b[4], 16)
+        return None
+
+    def poll(self):
+        """Refresh from the log. Returns True once a transfer has been seen."""
+        if not SERVICE_LOG.exists():
+            return False
+        for at, b in self._reports():
+            if at is None or (self.since and at < self.since):
+                continue
+            if b[:2] == ["61", "02"]:
+                remaining = int(b[3] + b[2], 16)
+                if self.remaining is not None and remaining > self.remaining + 1000:
+                    self.total = None  # a new transfer started
+                self.remaining, self.last_packet_at, self.finished = remaining, at, False
+            elif b[:2] == ["61", "03"] and self.remaining is not None:
+                self.finished = True
+        if self.remaining is not None and self.total is None:
+            self.total = self._find_total()
+        return self.remaining is not None
+
+    def seconds_since_last_packet(self):
+        if not self.last_packet_at:
+            return None
+        return (datetime.now().astimezone() - self.last_packet_at).total_seconds()
+
+
+class RateMeter:
+    def __init__(self):
+        self.first = None
+
+    def update(self, remaining):
+        now = time.monotonic()
+        if self.first is None or remaining > self.first[1]:
+            self.first = (now, remaining)
+        elapsed = now - self.first[0]
+        sent = self.first[1] - remaining
+        return sent / elapsed if elapsed >= 5 and sent > 0 else PACKETS_PER_SECOND
+
+
+def clock(seconds):
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+class StatusLine:
+    """Redraws one line in a terminal. When output is captured, prints a plain line every 15 s."""
+
+    def __init__(self):
+        self.tty = sys.stderr.isatty()
+        self.last_print = None
+
+    def show(self, line, final=False):
+        if self.tty:
+            print(f"\r{line}\033[K", end="\n" if final else "", file=sys.stderr, flush=True)
+            return
+        now = time.monotonic()
+        if final or self.last_print is None or now - self.last_print >= 15:
+            print(line, file=sys.stderr, flush=True)
+            self.last_print = now
+
+
+def progress_line(progress, rate):
+    if progress.finished or progress.remaining == 0:
+        return "[" + "#" * 30 + "] 100%  transfer complete"
+    if not progress.total:
+        return f"Sending... {progress.remaining:,} packets left, about {clock(progress.remaining / rate)}"
+    sent = progress.total - progress.remaining
+    frac = sent / progress.total
+    bar = "#" * int(frac * 30) + "-" * (30 - int(frac * 30))
+    return (f"[{bar}] {frac:4.0%}  {sent:,}/{progress.total:,} packets  "
+            f"{rate:.0f}/s  {clock(progress.remaining / rate)} left")
+
+
+def api_url(pid, resource, query=None):
+    url = f"{SERVER}/api/1/type/{DEVICE_TYPE_KEYBOARD}/model/{pid}/{resource}"
+    if query:
+        url += "?" + urllib.parse.urlencode({k: v for k, v in query.items() if v})
+    return url
+
+
+def request(url, data=None, headers=None, method=None, timeout=30):
+    req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        raise ToolError(f"server returned HTTP {e.code} for {url}: {detail}") from None
+    except urllib.error.URLError as e:
+        raise ToolError(
+            f"cannot reach Armoury Crate Gear at {SERVER} ({e.reason}). "
+            "Open Armoury Crate Gear and try again."
+        ) from None
+    try:
+        return json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        return {"raw": body}
+
+
+def find_keyboard():
+    # The devices route answers for whichever Azoth PID is connected.
+    result = request(api_url(PID_USB, "devices"))
+    entries = result.get("count") or []
+    if isinstance(entries, dict):
+        entries = [entries]
+    for entry in entries:
+        if entry.get("pid") in CONNECTIONS:
+            return {
+                "pid": entry["pid"],
+                "sn": entry.get("sn", ""),
+                "dongle_sn": entry.get("unify_dongle_sn", ""),
+                "name": entry.get("display_name", "ROG AZOTH EXTREME"),
+            }
+    raise ToolError("no ROG Azoth Extreme found. Connect it and open Armoury Crate Gear.")
+
+
+def device_query(kb):
+    return {"deviceSN": kb["sn"], "dongleSN": kb["dongle_sn"]}
+
+
+def current_profile(kb):
+    info = request(api_url(kb["pid"], "deviceInfo", device_query(kb)))
+    return info.get("profileID") or "1", info
+
+
+def image_size(path):
+    out = subprocess.run(
+        ["sips", "-g", "pixelWidth", "-g", "pixelHeight", str(path)],
+        capture_output=True, text=True,
+    )
+    width = height = None
+    for line in out.stdout.splitlines():
+        key, _, value = line.strip().partition(": ")
+        if key == "pixelWidth":
+            width = int(value)
+        elif key == "pixelHeight":
+            height = int(value)
+    if not width or not height:
+        raise ToolError(f"cannot read the image size of {path}")
+    return width, height
+
+
+def image_extension(path):
+    head = path.read_bytes()[:12]
+    if head.startswith(b"GIF8"):
+        return "gif"
+    if head.startswith(b"\x89PNG"):
+        return "png"
+    if head.startswith(b"\xff\xd8"):
+        return "jpeg"
+    if head.startswith(b"BM"):
+        return "bmp"
+    raise ToolError(f"{path.name} is not a GIF, PNG, JPEG, or BMP file")
+
+
+def gif_frame_count(path):
+    data = path.read_bytes()
+    pos, frames = 13, 0
+    if data[10] & 0x80:
+        pos += 3 * (2 << (data[10] & 7))
+    while pos < len(data):
+        block = data[pos]
+        if block == 0x2C:
+            frames += 1
+            flags = data[pos + 9]
+            pos += 10
+            if flags & 0x80:
+                pos += 3 * (2 << (flags & 7))
+            pos += 1  # LZW minimum code size
+        elif block == 0x21:
+            pos += 2
+        else:
+            break
+        while pos < len(data) and data[pos]:
+            pos += data[pos] + 1
+        pos += 1
+    return frames
+
+
+def upload_eta_seconds(frames):
+    packets = frames * PANEL_WIDTH * PANEL_HEIGHT * 2 / PACKET_PAYLOAD
+    return packets / PACKETS_PER_SECOND
+
+
+def crop_area(width, height, fit):
+    if fit == "stretch":
+        return {"left": 0, "top": 0, "width": width, "height": height}
+    # "cover": the largest centered region with the panel's aspect ratio.
+    target = PANEL_WIDTH / PANEL_HEIGHT
+    if width / height > target:
+        crop_w, crop_h = round(height * target), height
+    else:
+        crop_w, crop_h = width, round(width / target)
+    crop_w, crop_h = min(crop_w, width), min(crop_h, height)
+    return {
+        "left": (width - crop_w) // 2,
+        "top": (height - crop_h) // 2,
+        "width": crop_w,
+        "height": crop_h,
+    }
+
+
+def multipart(fields, file_field, file_path):
+    boundary = f"----azoth{uuid.uuid4().hex}"
+    lines = []
+    for name, value in fields.items():
+        lines += [
+            f"--{boundary}",
+            f'Content-Disposition: form-data; name="{name}"',
+            "",
+            str(value),
+        ]
+    head = ("\r\n".join(lines) + "\r\n").encode()
+    mime = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    file_head = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="{file_field}"; filename="{file_path.name}"\r\n'
+        f"Content-Type: {mime}\r\n\r\n"
+    ).encode()
+    tail = f"\r\n--{boundary}--\r\n".encode()
+    body = head + file_head + file_path.read_bytes() + tail
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def with_progress(fn):
+    done = threading.Event()
+    progress = TransferProgress(since=datetime.now().astimezone())
+    meter = RateMeter()
+    status = StatusLine()
+    last = []
+
+    def report():
+        start = time.monotonic()
+        while not done.wait(1):
+            try:
+                seen = progress.poll()
+            except OSError:
+                seen = False
+            if seen:
+                line = progress_line(progress, meter.update(progress.remaining))
+            else:
+                line = f"Preparing the image... {clock(time.monotonic() - start)}"
+            last[:] = [line]
+            status.show(line)
+
+    thread = threading.Thread(target=report, daemon=True)
+    thread.start()
+    try:
+        return fn()
+    finally:
+        done.set()
+        thread.join()
+        if last:
+            status.show(last[0], final=True)
+
+
+def cmd_status(args):
+    kb = find_keyboard()
+    profile, info = current_profile(kb)
+    print(f"Keyboard:    {kb['name']}")
+    print(f"Connection:  {CONNECTIONS[kb['pid']]} (PID {kb['pid']})")
+    print(f"Serial:      {kb['sn'] or 'unknown'}")
+    print(f"Profile:     {profile}")
+    print(f"Firmware:    {info.get('fwVersion', 'unknown')}")
+    if kb["pid"] == PID_BLE:
+        print("\nCustom uploads need wired mode. Connect the USB-C cable, switch the keyboard")
+        print("out of Bluetooth mode (in Bluetooth mode the cable only charges it), then run status again.")
+
+
+def cmd_upload(args):
+    path = Path(args.file).expanduser().resolve()
+    if not path.is_file():
+        raise ToolError(f"{path} does not exist")
+    ext = image_extension(path)
+    width, height = image_size(path)
+    crop = crop_area(width, height, args.fit)
+
+    kb = find_keyboard()
+    if kb["pid"] == PID_BLE and not args.force_ble:
+        raise ToolError(
+            "the keyboard is on Bluetooth. Armoury Crate blocks custom uploads over "
+            "Bluetooth, so connect the USB-C cable, switch the keyboard to wired mode, "
+            "and run this again."
+        )
+    profile = args.profile or current_profile(kb)[0]
+
+    fields = {
+        "resizeWidth": PANEL_WIDTH,
+        "resizeHeight": PANEL_HEIGHT,
+        # The server stores a BMP as JPEG, matching the Windows panel.
+        "extension": "jpeg" if ext == "bmp" else ext,
+        "cropArea": json.dumps(crop),
+        "originImageInfo": json.dumps({"width": width, "height": height}),
+        "rotateAngle": "0",
+        "profileID": profile,
+        "isOledAnimeGlobal": "true",
+        "isUploaded": "0",
+        "isRecommend": "0",
+    }
+    frames = 1
+    if ext == "gif":
+        fields["pages"] = min(args.frames, MAX_FRAMES)
+        frames = min(gif_frame_count(path) or 1, fields["pages"])
+    eta = upload_eta_seconds(frames)
+
+    print(f"File:        {path.name} ({width}x{height} {ext}, {frames} frame{'s' if frames != 1 else ''})")
+    print(f"Crop:        {crop['width']}x{crop['height']} at ({crop['left']}, {crop['top']}) -> {PANEL_WIDTH}x{PANEL_HEIGHT}")
+    print(f"Keyboard:    {CONNECTIONS[kb['pid']]} (PID {kb['pid']}), profile {profile}")
+    print(f"Estimate:    about {int(eta // 60)}:{int(eta % 60):02d} to transfer")
+    if eta > UPLOAD_TIMEOUT_S * 0.9:
+        print(f"Warning:     close to the server's 20 minute limit. Try --frames {int(frames * UPLOAD_TIMEOUT_S * 0.8 / eta)}.")
+    if args.dry_run:
+        print("\nDry run: nothing sent.")
+        print(json.dumps(fields, indent=2))
+        return
+
+    body, content_type = multipart(fields, "input", path)
+    url = api_url(kb["pid"], "amoled/animation", device_query(kb))
+    print("Uploading. Keep the cable in until it finishes.")
+    result = with_progress(
+        lambda: request(url, data=body, headers={"Content-Type": content_type},
+                        method="POST", timeout=UPLOAD_TIMEOUT_S),
+    )
+    print(f"Upload finished. Stored as {result.get('fileName', 'unknown')}.")
+    # The transfer only stores the animation. The OLED keeps playing the old one
+    # until it gets the same apply request the hidden panel's Apply button sends.
+    apply_uploaded(kb, profile)
+    print("Sent the apply command. If the OLED still shows the old animation, run: azoth-oled apply")
+
+
+def apply_uploaded(kb, profile):
+    body = json.dumps({
+        "profileID": profile,
+        "data": {"setOLEDIndex": "0", "isUploaded": "1", "customAnimePath": ""},
+        "isPreview": False,
+    }).encode()
+    request(api_url(kb["pid"], "amoled/animation", device_query(kb)), data=body,
+            headers={"Content-Type": "application/json"}, method="PATCH", timeout=180)
+
+
+def cmd_progress(args):
+    progress = TransferProgress()
+    meter = RateMeter()
+    status = StatusLine()
+    if not progress.poll():
+        raise ToolError(f"no transfer found in {SERVICE_LOG}")
+    while True:
+        done = progress.finished or progress.remaining == 0
+        idle = progress.seconds_since_last_packet()
+        if not done and idle is not None and idle > 20:
+            status.show(f"No packets for {int(idle)} s, so no upload is running.", final=True)
+            return
+        status.show(progress_line(progress, meter.update(progress.remaining)), final=done)
+        if done:
+            return
+        time.sleep(1)
+        progress.poll()
+
+
+def cmd_apply(args):
+    kb = find_keyboard()
+    profile = args.profile or current_profile(kb)[0]
+    apply_uploaded(kb, profile)
+    print(f"Playing the last uploaded animation, saved to profile {profile}.")
+
+
+def cmd_preset(args):
+    kb = find_keyboard()
+    profile = args.profile or current_profile(kb)[0]
+    body = json.dumps({
+        "profileID": profile,
+        "data": {"preloadAnimationId": args.id},
+        "isPreview": False,
+    }).encode()
+    request(api_url(kb["pid"], "amoled", device_query(kb)), data=body,
+            headers={"Content-Type": "application/json"}, method="PATCH", timeout=60)
+    print(f"Preset {args.id} ({PRESETS[args.id]}) applied to profile {profile}.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="azoth-oled",
+        description="Upload custom GIFs and images to the ROG Azoth Extreme OLED on macOS.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("status", help="show the connected keyboard and connection type")
+
+    up = sub.add_parser("upload", help="upload a GIF, PNG, JPEG, or BMP to the OLED")
+    up.add_argument("file")
+    up.add_argument("--fit", choices=["cover", "stretch"], default="cover",
+                    help="cover crops the center to the panel shape (default); stretch squashes the whole image")
+    up.add_argument("--frames", type=int, default=MAX_FRAMES,
+                    help=f"maximum GIF frames to keep (firmware limit {MAX_FRAMES})")
+    up.add_argument("--profile", help="profile ID to save into (default: the active profile)")
+    up.add_argument("--dry-run", action="store_true", help="show what would be sent without uploading")
+    up.add_argument("--force-ble", action="store_true", help=argparse.SUPPRESS)
+
+    sub.add_parser("progress", help="show a live progress bar for an upload that is already running")
+
+    app = sub.add_parser("apply", help="play the last uploaded animation again, without re-uploading")
+    app.add_argument("--profile", help="profile ID to save into (default: the active profile)")
+
+    pre = sub.add_parser("preset", help="switch back to a built-in animation")
+    pre.add_argument("id", choices=sorted(PRESETS), help=", ".join(f"{k}={v}" for k, v in PRESETS.items()))
+    pre.add_argument("--profile", help="profile ID to save into (default: the active profile)")
+
+    args = parser.parse_args()
+    try:
+        {"status": cmd_status, "upload": cmd_upload, "progress": cmd_progress,
+         "apply": cmd_apply, "preset": cmd_preset}[args.command](args)
+    except ToolError as e:
+        print(f"azoth-oled: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nInterrupted. The keyboard may still be finishing the transfer.", file=sys.stderr)
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

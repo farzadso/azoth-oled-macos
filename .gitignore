@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Personal animations. Most GIFs are someone else's copyrighted footage.
+gifs/
+
+# Maintainer handoff notes, kept out of the public repository.
+HANDOFF.md
